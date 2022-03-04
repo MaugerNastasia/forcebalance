@@ -110,6 +110,12 @@ class Liquid(Target):
         self.set_option(tgt_opts,'manual')
         # Don't target the average enthalpy of vaporization and allow it to freely float (experimental)
         self.set_option(tgt_opts,'hvap_subaverage')
+        #Use (or not) of PIMD
+        self.set_option(tgt_opts,'pimd',forceprint=True)
+        #Number of beads if PIMD is used
+        self.set_option(tgt_opts,'liquid_nbeads',forceprint=True)
+        #Number of beads if PIMD is used
+        self.set_option(tgt_opts,'gas_nbeads',forceprint=True)
         # Number of time steps in the liquid "equilibration" run
         self.set_option(tgt_opts,'liquid_eq_steps',forceprint=True)
         # Number of time steps in the liquid "production" run
@@ -201,7 +207,7 @@ class Liquid(Target):
         # Extra files to be linked into the temp-directory.
         self.nptfiles += [self.liquid_coords, self.gas_coords]
         # Scripts to be copied from the ForceBalance installation directory.
-        self.scripts += ['npt.py']
+        self.scripts += ['npt.py','pimd_liquid.sh', 'pimd_gas.sh']
         #  NVT simulation parameters for computing Surface Tension
         if 'surf_ten' in self.RefData:
             # Check if nvt_coords exist
@@ -253,7 +259,7 @@ class Liquid(Target):
 
     def read_data(self):
         # Read the 'data.csv' file. The file should contain guidelines.
-        with open(os.path.join(self.tgtdir,'data.csv'),'rU') as f: R0 = list(csv.reader(f))
+        with open(os.path.join(self.tgtdir,'data.csv'),'r') as f: R0 = list(csv.reader(f))
         # All comments are erased.
         R1 = [[sub('#.*$','',word) for word in line] for line in R0 if len(line[0]) > 0 and line[0][0] != "#"]
         # All empty lines are deleted and words are converted to lowercase.
@@ -727,10 +733,9 @@ class Liquid(Target):
         @return property_results
 
         """
-
         unpack = lp_load('forcebalance.p')
         mvals1 = unpack[1]
-        if len(mvals) > 0 and (np.max(np.abs(mvals1 - mvals)) > 1e-3):
+        if len(mvals) > 0 and (np.max(np.abs(np.array(mvals1) - np.array(mvals))) > 0.001):
             warn_press_key("mvals from forcebalance.p does not match up with internal values! (Are you reading data from a previous run?)\nmvals(call)=%s mvals(disk)=%s" % (mvals, mvals1))
 
         mbar_verbose = False
@@ -1148,6 +1153,7 @@ class Liquid(Target):
         Gradient = np.zeros(self.FF.np)
         Hessian = np.zeros((self.FF.np,self.FF.np))
 
+
         if X_Rho == 0: self.w_rho = 0.0
         if X_Hvap == 0: self.w_hvap = 0.0
         if X_Alpha == 0: self.w_alpha = 0.0
@@ -1155,6 +1161,7 @@ class Liquid(Target):
         if X_Cp == 0: self.w_cp = 0.0
         if X_Eps0 == 0: self.w_eps0 = 0.0
         if X_Surf_ten == 0: self.w_surf_ten = 0.0
+        
 
         if self.w_normalize:
             w_tot = self.w_rho + self.w_hvap + self.w_alpha + self.w_kappa + self.w_cp + self.w_eps0 + self.w_surf_ten

@@ -52,9 +52,15 @@ engname          = args.engine.lower()     # Name of the engine
 
 if engname == "openmm":
     try:
-        from simtk.unit import *
-        from simtk.openmm import *
-        from simtk.openmm.app import *
+        try:
+            from openmm.unit import *
+            from openmm import *
+            from openmm.app import *
+        except ImportError:
+            from simtk.unit import *
+            from simtk.openmm import *
+            from simtk.openmm.app import *
+
     except:
         traceback.print_exc()
         raise Exception("Cannot import OpenMM modules")
@@ -277,11 +283,13 @@ def main():
     liquid_nequil = TgtOptions['liquid_eq_steps']
     liquid_intvl = TgtOptions['liquid_interval']
     liquid_fnm = TgtOptions['liquid_coords']
+    liquid_nbeads = TgtOptions ['liquid_nbeads']
     gas_timestep = TgtOptions['gas_timestep']
     gas_nsteps = TgtOptions['gas_md_steps']
     gas_nequil = TgtOptions['gas_eq_steps']
     gas_intvl = TgtOptions['gas_interval']
     gas_fnm = TgtOptions['gas_coords']
+    gas_nbeads = TgtOptions ['gas_nbeads']
 
     # Number of threads, multiple timestep integrator, anisotropic box etc.
     threads = TgtOptions.get('md_threads', 1)
@@ -291,6 +299,7 @@ def main():
     nbarostat = TgtOptions.get('n_mcbarostat', 25)
     anisotropic = TgtOptions.get('anisotropic_box', 0)
     minimize = TgtOptions.get('minimize_energy', 1)
+    pimd = TgtOptions.get ('pimd',0)
 
     # Print all options.
     printcool_dictionary(TgtOptions, title="Options from ForceBalance")
@@ -398,11 +407,13 @@ def main():
                                     ("nsave", int(1000 * liquid_intvl / liquid_timestep)),
                                     ("verbose", True), ('save_traj', TgtOptions['save_traj']), 
                                     ("threads", threads), ("anisotropic", anisotropic), ("nbarostat", nbarostat),
-                                    ("mts", mts), ("rpmd_beads", rpmd_beads), ("faststep", faststep)])
+                                    ("mts", mts), ("rpmd_beads", rpmd_beads), ("faststep", faststep),
+                                    ("pimd", pimd), ("nbeads", liquid_nbeads) ])
     MDOpts["gas"] = OrderedDict([("nsteps", gas_nsteps), ("timestep", gas_timestep),
                                  ("temperature", temperature), ("nsave", int(1000 * gas_intvl / gas_timestep)),
                                  ("nequil", gas_nequil), ("minimize", minimize), ("threads", 1), ("mts", mts),
-                                 ("rpmd_beads", rpmd_beads), ("faststep", faststep)])
+                                 ("rpmd_beads", rpmd_beads), ("faststep", faststep), ("pimd", pimd),
+                                 ("nbeads", gas_nbeads)])
 
     # Energy components analysis disabled for OpenMM MTS because it uses force groups
     if (engname == "openmm" and mts): logger.warn("OpenMM with MTS integrator; energy components analysis will be disabled.\n")

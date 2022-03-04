@@ -12,13 +12,18 @@ from __future__ import print_function
 from builtins import str
 from builtins import zip
 from builtins import range
-import os, shutil
+import os, shutil,sys
 from re import match, sub
 from forcebalance.nifty import *
 from forcebalance.nifty import _exec
 import time
 import numpy as np
 import networkx as nx
+import os
+import re
+import glob
+import csv
+from pathlib import Path
 from copy import deepcopy
 from forcebalance import BaseReader
 from subprocess import Popen, PIPE
@@ -342,7 +347,7 @@ class TINKER(Engine):
             crdfile = onefile(kwargs.get('coords'), 'arc', err=True)
             self.mol = Molecule(crdfile)
 
-    def calltinker(self, command, stdin=None, print_to_screen=False, print_command=False, **kwargs):
+    def calltinker(self, command, stdin=None, print_to_screen=True, print_command=False, **kwargs):
 
         """ Call TINKER; prepend the tinkerpath to calling the TINKER program. """
 
@@ -351,7 +356,14 @@ class TINKER(Engine):
         if "%s.key" % self.name in csplit and not os.path.exists("%s.key" % self.name):
             LinkFile(self.abskey, "%s.key" % self.name)
         prog = os.path.join(self.tinkerpath, csplit[0])
-        csplit[0] = prog
+        #if (csplit[0]=='pimd'):
+        #    csplit[0]= 'mpirun -np 1 '+ prog
+        #elif (csplit[0]=='dynamic'):
+        #    csplit[0]= 'mpirun -np 1 '+ prog
+        #elif (csplit[0]=='minimize'):
+        #    csplit[0]= 'mpirun -np 1 '+ prog
+        #else:     
+        csplit[0] = 'mpirun -np 1 '+prog
         o = _exec(' '.join(csplit), stdin=stdin, print_to_screen=print_to_screen, print_command=print_command, rbytes=1024, **kwargs)
         # Determine the TINKER version number.
         for line in o[:10]:
@@ -360,7 +372,11 @@ class TINKER(Engine):
                 if len(vw.split('.')) <= 2:
                     vn = float(vw)
                 else:
-                    vn = float(vw.split('.')[:2])
+                    ls = vw.split('.')
+                    last = ls[1:]
+                    first = ls[0]
+                    vn = first+'.'+''.join(last)
+                    vn = float(vn)
                 vn_need = 6.3
                 try:
                     if vn < vn_need:
@@ -390,7 +406,7 @@ class TINKER(Engine):
         """ Called by __init__ ; prepare the temp directory and figure out the topology. """
 
         # Call TINKER but do nothing to figure out the version number.
-        o = self.calltinker("dynamic", persist=1, print_error=False)
+        o = self.calltinker('mpirun -np 1 pimd', persist=1, print_error=False)
 
         self.rigid = False
 
@@ -467,7 +483,7 @@ class TINKER(Engine):
                 warn_press_key("nonbonded_cutoff = %.1f should be smaller than half the box size = %.1f Angstrom" % (rpme, minbox))
             tk_defs['ewald-cutoff'] = "%f" % rpme
             # TINKER likes to use up to 9.0 Angstrom for vdW cutoffs
-            rvdw = 0.5*(float(int(minbox - 1))) if minbox <= 19 else 9.0
+            rvdw = 0.5*(float(int(minbox - 1))) if minbox <= 19 else 7.0
             if 'nonbonded_cutoff' in kwargs and 'vdw_cutoff' not in kwargs:
                 warn_press_key('AMOEBA detected and nonbonded_cutoff is set, but not vdw_cutoff (so it will be set equal to nonbonded_cutoff)')
                 rvdw = kwargs['nonbonded_cutoff']
@@ -483,9 +499,9 @@ class TINKER(Engine):
         else:
             if 'nonbonded_cutoff' in kwargs or 'vdw_cutoff' in kwargs:
                 warn_press_key('No periodic boundary conditions, your provided nonbonded_cutoff and vdw_cutoff will not be used')
-            tk_opts['ewald'] = None
-            tk_opts['ewald-cutoff'] = None
-            tk_opts['vdw-cutoff'] = None
+            tk_opts['ewald-cutoff'] = 7.0
+            tk_opts['vdw-cutoff'] = 7.0
+            tk_opts['a-axis']=18.643
             # This seems to have no effect on the kinetic energy.
             # tk_opts['remove-inertia'] = '0'
 
@@ -498,7 +514,7 @@ class TINKER(Engine):
         self.mol.require('tinkersuf')
 
         ## Call analyze to read information needed to build the atom lists.
-        o = self.calltinker("analyze %s.xyz P,C" % (self.name), stdin="ALL")
+        o = self.calltinker("analyze_ponder %s.xyz P,C" % (self.name), stdin="ALL")
 
         ## Parse the output of analyze.
         mode = 0
@@ -553,7 +569,7 @@ class TINKER(Engine):
             for f in self.FF.fnms: 
                 os.unlink(f)
 
-    def optimize(self, shot, method="newton", align=True, crit=1e-4):
+    def optimize(self, shot, method="newton", align=True, crit=0.01):
 
         """ Optimize the geometry and align the optimized geometry to the starting geometry. """
 
@@ -568,6 +584,7 @@ class TINKER(Engine):
         elif method == "bfgs":
             if self.rigid: optprog = "minrigid"
             else: optprog = "minimize"
+            
         else:
             raise RuntimeError("Incorrect choice of method for TINKER.optimize()")
         
@@ -612,7 +629,7 @@ class TINKER(Engine):
             if "Limited Memory BFGS Quasi-Newton Optimization" in line: mode = 1
             if mode == 1 and isint(s[0]): mode = 2
             if mode == 2:
-                if isint(s[0]): E = float(s[1])
+                if isint(s[0]): E = float(s[1].replace('D','e'))
                 else: mode = 0
             if "Normal Termination" in line:
                 cnvgd = 1
@@ -622,7 +639,7 @@ class TINKER(Engine):
             logger.info("The minimization did not converge in the geometry optimization - printout is above.\n")
         return E, rmsd, M12[1]
 
-    def evaluate_(self, xyzin, force=False, dipole=False):
+    def evaluate_(self, xyzin, force=False, dipole=False,pimd=False):
 
         """ 
         Utility function for computing energy, and (optionally) forces and dipoles using TINKER. 
@@ -636,48 +653,119 @@ class TINKER(Engine):
         Result: Dictionary containing energies, forces and/or dipoles.
         """
 
+        if type(xyzin) is list:
+            pimd=True
+            nbeads=len(xyzin) 
+        else:
+            pimd=False
         Result = OrderedDict()
         # If we want the dipoles (or just energies), analyze is the way to go.
-        if dipole or (not force):
-            oanl = self.calltinker("analyze %s -k %s" % (xyzin, self.name), stdin="G,E,M", print_to_screen=False)
-            # Read potential energy and dipole from file.
-            eanl = []
-            dip = []
-            for line in oanl:
-                s = line.split()
-                if 'Total Potential Energy : ' in line:
-                    eanl.append(float(s[4]) * 4.184)
-                if dipole:
-                    if 'Dipole X,Y,Z-Components :' in line:
-                        dip.append([float(s[i]) for i in range(-3,0)])
-            Result["Energy"] = np.array(eanl)
-            Result["Dipole"] = np.array(dip)
-        # If we want forces, then we need to call testgrad.
-        if force:
-            E = []
-            F = []
-            Fi = []
-            o = self.calltinker("testgrad %s -k %s y n n" % (xyzin, self.name))
-            i = 0
-            ReadFrc = 0
-            for line in o:
-                s = line.split()
-                if "Total Potential Energy" in line:
-                    E.append(float(s[4]) * 4.184)
-                if "Cartesian Gradient Breakdown over Individual Atoms" in line:
-                    ReadFrc = 1
-                if ReadFrc and len(s) == 6 and all([s[0] == 'Anlyt',isint(s[1]),isfloat(s[2]),isfloat(s[3]),isfloat(s[4]),isfloat(s[5])]):
-                    ReadFrc = 2
-                    if self.AtomMask[i]:
-                        Fi += [-1 * float(j) * 4.184 * 10 for j in s[2:5]]
-                    i += 1
-                if ReadFrc == 2 and len(s) < 6:
-                    ReadFrc = 0
-                    F.append(Fi)
+        if pimd:
+            if dipole or (not force):
+                for l in xyzin:
+                    print ('I am on beads: ')
+                    print(l)
+                    oanl = self.calltinker("analyze %s -k %s" % (l, self.name), stdin="E", print_to_screen=True)
+                    oanl_m = self.calltinker("analyze %s -k %s" % (l, self.name), stdin="D", print_to_screen=True)
+                    # Read potential energy and dipole from file.
+                    eanl = []
+                    dip = []
+                    energies = []
+                    dipoles = []
+                    for line in oanl:
+                        s = line.split()
+                        if 'Total Potential Energy : ' in line:
+                            eanl.append(float(s[4]) * 4.184)
+                    if dipole:
+                        for line in oanl_m:
+                            s=line.split()
+                            if 'Dipole X,Y,Z-Components :' in line:
+                                dip.append([float(s[i]) for i in range(-3,0)])
+                    fe="Energy_"+l+".txt"
+                    eanl=np.array(eanl)
+                    energies.append(eanl)
+                    np.savetxt(fe,np.array(energies))
+                    dip=np.array(dip)
+                    dipoles.append(dip)
+                energies=np.array(energies)
+                dipoles=np.array(dipoles)
+                Result["Energy"]= np.mean(energies,axis=0)  
+                Result["Dipole"]= np.mean(dipoles,axis=0)  
+            if force:
+                for l in xyzin:
+                    E = []
+                    F = []
                     Fi = []
+                    energies = []
+                    forces = []
+                    o = self.calltinker("testgrad %s -k %s y n n" % (l, self.name))
                     i = 0
-            Result["Energy"] = np.array(E)
-            Result["Force"] = np.array(F)
+                    ReadFrc = 0
+                    for line in o:
+                        s = line.split()
+                        if "Total Potential Energy" in line:
+                            E.append(float(s[4]) * 4.184)
+                        if "Cartesian Gradient Breakdown over Individual Atoms" in line:
+                            ReadFrc = 1
+                        if ReadFrc and len(s) == 6 and all([s[0] == 'Anlyt',isint(s[1]),isfloat(s[2]),isfloat(s[3]),isfloat(s[4]),isfloat(s[5])]):
+                            ReadFrc = 2
+                            if self.AtomMask[i]:
+                                Fi += [-1 * float(j) * 4.184 * 10 for j in s[2:5]]
+                            i += 1
+                        if ReadFrc == 2 and len(s) < 6:
+                            ReadFrc = 0
+                            F.append(Fi)
+                            Fi = []
+                            i = 0
+                    E=np.array(E)
+                    energies.append(E)
+                    F=np.array(F)
+                    forces.append(F)
+                energies=np.array(energies)
+                forces=np.array(forces)
+                Result["Energy"] = np.mean(energies,axis=0)
+                Result["Force"] = np.mean(forces,axis=0)
+        else:
+            if dipole or (not force):
+                oanl = self.calltinker("analyze %s -k %s" % (xyzin, self.name), stdin="E,D", print_to_screen=True)
+                # Read potential energy and dipole from file.
+                eanl = []
+                dip = []
+                for line in oanl:
+                    s = line.split()
+                    if 'Total Potential Energy : ' in line:
+                        eanl.append(float(s[4]) * 4.184)
+                    if dipole:
+                        if 'Dipole X,Y,Z-Components :' in line:
+                            dip.append([float(s[i]) for i in range(-3,0)])
+                Result["Energy"] = np.array(eanl)
+                Result["Dipole"] = np.array(dip)
+            # If we want forces, then we need to call testgrad.
+            if force:
+                E = []
+                F = []
+                Fi = []
+                o = self.calltinker("testgrad %s -k %s y n n" % (xyzin, self.name))
+                i = 0
+                ReadFrc = 0
+                for line in o:
+                    s = line.split()
+                    if "Total Potential Energy" in line:
+                        E.append(float(s[4]) * 4.184)
+                    if "Cartesian Gradient Breakdown over Individual Atoms" in line:
+                        ReadFrc = 1
+                    if ReadFrc and len(s) == 6 and all([s[0] == 'Anlyt',isint(s[1]),isfloat(s[2]),isfloat(s[3]),isfloat(s[4]),isfloat(s[5])]):
+                        ReadFrc = 2
+                        if self.AtomMask[i]:
+                            Fi += [-1 * float(j) * 4.184 * 10 for j in s[2:5]]
+                        i += 1
+                    if ReadFrc == 2 and len(s) < 6:
+                        ReadFrc = 0
+                        F.append(Fi)
+                        Fi = []
+                        i = 0
+                Result["Energy"] = np.array(E)
+                Result["Force"] = np.array(F)
         return Result
 
     def get_charges(self):
@@ -718,7 +806,7 @@ class TINKER(Engine):
     def energy_dipole(self):
 
         """ Computes the energy and dipole using TINKER over a trajectory. """
-
+         
         if hasattr(self, 'md_trajectory') : 
             x = self.md_trajectory
         else:
@@ -769,11 +857,13 @@ class TINKER(Engine):
         
         # This line actually runs TINKER
         if optimize:
+            print(self.name)
             self.optimize(shot, crit=1e-6)
-            o = self.calltinker("analyze %s.xyz_2 M" % (self.name))
+            o = self.calltinker("analyze_ponder %s.xyz_2 M" % (self.name))
         else:
+            print(self.name)
             self.mol[shot].write('%s.xyz' % self.name, ftype="tinker")
-            o = self.calltinker("analyze %s.xyz M" % (self.name))
+            o = self.calltinker("analyze_ponder %s.xyz M" % (self.name))
         # Read the TINKER output.
         qn = -1
         ln = 0
@@ -834,7 +924,7 @@ class TINKER(Engine):
         # xyzfnm = sysname+".xyz"
         if optimize:
             E_, rmsd, _ = self.optimize(shot)
-            o = self.calltinker("analyze %s.xyz_2 E" % self.name)
+            o = self.calltinker("analyze_ponder %s.xyz_2 E" % self.name)
             #----
             # Two equivalent ways to get the RMSD, here for reference.
             #----
@@ -850,7 +940,7 @@ class TINKER(Engine):
             #----
             os.system("rm %s.xyz_2" % self.name)
         else:
-            o = self.calltinker("analyze %s.xyz E" % self.name)
+            o = self.calltinker("analyze_ponder %s.xyz E" % self.name)
         # Read the TINKER output. 
         E = None
         for line in o:
@@ -859,7 +949,7 @@ class TINKER(Engine):
         if E is None:
             logger.error("Total potential energy wasn't encountered when calling analyze!\n")
             raise RuntimeError
-        if optimize and abs(E-E_) > 0.1:
+        if optimize and abs(E-E_) > 1.5:
             warn_press_key("Energy from optimize and analyze aren't the same (%.3f vs. %.3f)" % (E, E_))
         return E, rmsd
 
@@ -873,7 +963,7 @@ class TINKER(Engine):
         # Interaction energy needs to be in kcal/mol.
         return (self.energy() - self.A.energy() - self.B.energy()) / 4.184
 
-    def molecular_dynamics(self, nsteps, timestep, temperature=None, pressure=None, nequil=0, nsave=1000, minimize=True, anisotropic=False, threads=1, verbose=False, **kwargs):
+    def molecular_dynamics(self, nsteps, timestep, temperature=None, pressure=None, nequil=0, nsave=1000, minimize=True, anisotropic=False, threads=1, verbose=True, pimd=False, nbeads=0,**kwargs):
         
         """
         Method for running a molecular dynamics simulation.  
@@ -896,15 +986,19 @@ class TINKER(Engine):
         Dips        = (3xN array) Dipole moments
         EComps      = (dict)      Energy components
         """
-
+        
+        
         md_defs = OrderedDict()
         md_opts = OrderedDict()
         # Print out averages only at the end.
         md_opts["printout"] = nsave
         md_opts["openmp-threads"] = threads
+        md_opts["verbose"] =''
         # Langevin dynamics for temperature control.
         if temperature is not None:
-            md_defs["integrator"] = "stochastic"
+             if pimd:
+                md_opts["nbeads"]=nbeads
+#            md_defs["integrator"] = "stochastic"
         else:
             md_defs["integrator"] = "beeman"
             md_opts["thermostat"] = None
@@ -912,9 +1006,11 @@ class TINKER(Engine):
         if self.pbc:
             md_opts["vdw-correction"] = ''
             if temperature is not None and pressure is not None: 
-                md_defs["integrator"] = "beeman"
-                md_defs["thermostat"] = "bussi"
-                md_defs["barostat"] = "montecarlo"
+                if pimd:
+                    md_opts["nbeads"]=nbeads
+#                md_defs["integrator"] = "beeman"
+#                md_defs["thermostat"] = "bussi"
+#                md_defs["barostat"] = "montecarlo"
                 if anisotropic:
                     md_opts["aniso-pressure"] = ''
             elif pressure is not None:
@@ -929,10 +1025,13 @@ class TINKER(Engine):
 
         eq_opts = deepcopy(md_opts)
         if self.pbc and temperature is not None and pressure is not None: 
-            eq_opts["integrator"] = "beeman"
-            eq_opts["thermostat"] = "bussi"
-            eq_opts["barostat"] = "berendsen"
-
+             if pimd:
+                md_opts["nbeads"]=nbeads
+#            eq_opts["integrator"] = "beeman"
+#         eq_opts["thermostat"] = "bussi"
+#            eq_opts["barostat"] = "berendsen"
+          
+  
         if minimize:
             if verbose: logger.info("Minimizing the energy...")
             self.optimize(0, method="bfgs", crit=1)
@@ -940,111 +1039,231 @@ class TINKER(Engine):
             if verbose: logger.info("Done\n")
 
         # Run equilibration.
-        if nequil > 0:
-            write_key("%s-eq.key" % self.name, eq_opts, "%s.key" % self.name, md_defs)
-            if verbose: printcool("Running equilibration dynamics", color=0)
+        if pimd:
+            if nequil > 0:
+                write_key("%s-eq.key" % self.name, eq_opts, "%s.key" % self.name, md_defs)
+                if verbose: printcool("Running PIMD equilibration dynamics", color=0)
+                if self.pbc and pressure is not None:
+                    self.calltinker("pimd %s -k %s-eq %i %f %f 4 %f %f" % (self.name, self.name, nequil, timestep, float(nsave*timestep)/1000, 
+                                                                              temperature, pressure), print_to_screen=verbose)
+                else:
+                    self.calltinker("pimd %s -k %s-eq %i %f %f 2 %f" % (self.name, self.name, nequil, timestep, float(nsave*timestep)/1000,
+                                                                           temperature), print_to_screen=verbose)
+                os.system("rm -f %s_beads*.arc" % (self.name))
+
+            # Run production.
+            if verbose: printcool("Running PIMD production dynamics", color=0)
+            write_key("%s-md.key" % self.name, md_opts, "%s.key" % self.name, md_defs)
             if self.pbc and pressure is not None:
-                self.calltinker("dynamic %s -k %s-eq %i %f %f 4 %f %f" % (self.name, self.name, nequil, timestep, float(nsave*timestep)/1000, 
-                                                                          temperature, pressure), print_to_screen=verbose)
-            else:
-                self.calltinker("dynamic %s -k %s-eq %i %f %f 2 %f" % (self.name, self.name, nequil, timestep, float(nsave*timestep)/1000,
-                                                                       temperature), print_to_screen=verbose)
-            os.system("rm -f %s.arc" % (self.name))
-
-        # Run production.
-        if verbose: printcool("Running production dynamics", color=0)
-        write_key("%s-md.key" % self.name, md_opts, "%s.key" % self.name, md_defs)
-        if self.pbc and pressure is not None:
-            odyn = self.calltinker("dynamic %s -k %s-md %i %f %f 4 %f %f" % (self.name, self.name, nsteps, timestep, float(nsave*timestep/1000), 
-                                                                             temperature, pressure), print_to_screen=verbose)
-        else:
-            odyn = self.calltinker("dynamic %s -k %s-md %i %f %f 2 %f" % (self.name, self.name, nsteps, timestep, float(nsave*timestep/1000), 
-                                                                          temperature), print_to_screen=verbose)
-            
-        # Gather information.
-        os.system("mv %s.arc %s-md.arc" % (self.name, self.name))
-        self.md_trajectory = "%s-md.arc" % self.name
-        edyn = []
-        kdyn = []
-        temps = []
-        for line in odyn:
-            s = line.split()
-            if 'Current Potential' in line:
-                edyn.append(float(s[2]))
-            if 'Current Kinetic' in line:
-                kdyn.append(float(s[2]))
-            if len(s) > 0 and s[0] == 'Temperature' and s[2] == 'Kelvin':
-                temps.append(float(s[1]))
-
-        # Potential and kinetic energies converted to kJ/mol.
-        edyn = np.array(edyn) * 4.184
-        kdyn = np.array(kdyn) * 4.184
-        temps = np.array(temps)
-    
-        if verbose: logger.info("Post-processing to get the dipole moments\n")
-        oanl = self.calltinker("analyze %s-md.arc" % self.name, stdin="G,E,M", print_to_screen=False)
-
-        # Read potential energy and dipole from file.
-        eanl = []
-        dip = []
-        mass = 0.0
-        ecomp = OrderedDict()
-        havekeys = set()
-        first_shot = True
-        for ln, line in enumerate(oanl):
-            strip = line.strip()
-            s = line.split()
-            if 'Total System Mass' in line:
-                mass = float(s[-1])
-            if 'Total Potential Energy : ' in line:
-                eanl.append(float(s[4]))
-            if 'Dipole X,Y,Z-Components :' in line:
-                dip.append([float(s[i]) for i in range(-3,0)])
-            if first_shot:
+                odyn = self.calltinker("pimd %s -k %s-md %i %f %f 4 %f %f" % (self.name, self.name, nsteps, timestep, float(nsave*timestep/1000), 
+                                                                                 temperature, pressure), print_to_screen=verbose)
+                os.system("sh pimd_liquid.sh " + str(nbeads))
+                ecomp = OrderedDict()
                 for key in eckeys:
-                    if strip.startswith(key):
-                        if key in ecomp:
-                            ecomp[key].append(float(s[-2])*4.184)
-                        else:
-                            ecomp[key] = [float(s[-2])*4.184]
-                        if key in havekeys:
-                            first_shot = False
-                        havekeys.add(key)
+                    ecomp["Bond Stretching"] = np.loadtxt('Bond_Streching_all_beads.out')
+                    ecomp["Angle Bending"] = np.loadtxt('Angle_Bending_all_beads.out')
+                    ecomp["Urey-Bradley"] = np.loadtxt('Urey-Bradley_all_beads.out')
+                    ecomp["Atomic Multipoles"] = np.loadtxt('Atomic_Multipoles_all_beads.out')
+                    ecomp["Van der Waals"] = np.loadtxt('VdW_all_beads.out')
+                    ecomp["Polarization"] = np.loadtxt('Polarization_all_beads.out')
             else:
-                for key in havekeys:
-                    if strip.startswith(key):
-                        if key in ecomp:
-                            ecomp[key].append(float(s[-2])*4.184)
-                        else:
-                            ecomp[key] = [float(s[-2])*4.184]
-        for key in ecomp:
-            ecomp[key] = np.array(ecomp[key])
-        ecomp["Potential Energy"] = edyn
-        ecomp["Kinetic Energy"] = kdyn
-        ecomp["Temperature"] = temps
-        ecomp["Total Energy"] = edyn+kdyn
+                odyn = self.calltinker("pimd %s -k %s-md %i %f %f 2 %f" % (self.name, self.name, nsteps, timestep, float(nsave*timestep/1000), 
+                                                                          temperature), print_to_screen=verbose)
+                os.system("sh pimd_gas.sh " + str(nbeads))
+                ecomp = OrderedDict()
+                for key in eckeys:
+                    ecomp["Bond Stretching"] = np.loadtxt('Bond_Streching_all_beads.out')
+                    ecomp["Angle Bending"] = np.loadtxt('Angle_Bending_all_beads.out')
+                    ecomp["Urey-Bradley"] = np.loadtxt('Urey-Bradley_all_beads.out')
+                    ecomp["Atomic Multipoles"] = np.loadtxt('Atomic_Multipoles_all_beads.out')
+                    ecomp["Van der Waals"] = np.zeros_like(ecomp["Bond Stretching"]) 
+                    ecomp["Polarization"] = np.zeros_like(ecomp["Bond Stretching"])
+                
 
-        # Energies in kilojoules per mole
-        eanl = np.array(eanl) * 4.184
-        # Dipole moments in debye
-        dip = np.array(dip)
-        # Volume of simulation boxes in cubic nanometers
-        # Conversion factor derived from the following:
-        # In [22]: 1.0 * gram / mole / (1.0 * nanometer)**3 / AVOGADRO_CONSTANT_NA / (kilogram/meter**3)
-        # Out[22]: 1.6605387831627252
-        conv = 1.6605387831627252
-        if self.pbc:
-            vol = np.array([BuildLatticeFromLengthsAngles(*[float(j) for j in line.split()]).V \
-                                for line in open("%s-md.arc" % self.name).readlines() \
-                                if (len(line.split()) == 6 and isfloat(line.split()[1]) \
-                                        and all([isfloat(i) for i in line.split()[:6]]))]) / 1000
-            rho = conv * mass / vol
+              
+            self.md_trajectory=[]
+            for i in range(1,nbeads+1):
+                f=str(i)
+                if i >=10:
+                    tf = "%s-md_beads0%s.arc" % (self.name,f)
+                else:
+                    tf = "%s-md_beads00%s.arc" % (self.name,f)
+                self.md_trajectory.append(tf)
+            edyn = []
+            kdyn = []
+            temps = []
+            for line in odyn:
+                s = line.split()
+                if 'Current Potential' in line:
+                    edyn.append(float(s[2]))
+                if 'Current Kinetic' in line:
+                    kdyn.append(float(s[2]))
+                      
+                if len(s) > 0 and s[0] == 'Temperature' and s[2] == 'Kelvin':
+                    temps.append(float(s[1]))
+
+            # Potential and kinetic energies converted to kJ/mol.
+            edyn = np.array(edyn) * 4.184
+            kdyn = np.array(kdyn) * 4.184
+            temps = np.array(temps)
+
+            # Read potential energy and dipole from file.
+            eanl = []
+            dip = []
+            mass = 0.0
+            first_shot = True
+            mass=np.loadtxt('Total_System_Mass_all_beads.out')[0]
+            eanl=np.loadtxt('Total_Potential_Energy_all_beads.out')
+            dip=np.loadtxt('Dipole_Components_all_beads.out') 
+          
+
+            ecomp["Potential Energy"] = edyn
+            ecomp["Kinetic Energy"] = kdyn
+            ecomp["Temperature"] = temps
+            ecomp["Total Energy"] = kdyn+edyn
+
+            # Energies in kilojoules per mole
+            eanl = np.array(eanl) * 4.184
+            # Dipole moments in debye
+            dip = np.array(dip)
+
+#           Volume of simulation boxes in cubic nanometers
+#           Conversion factor derived from the following:
+#           In [22]: 1.0 * gram / mole / (1.0 * nanometer)**3 / AVOGADRO_CONSTANT_NA / (kilogram/meter**3)
+#           Out[22]: 1.6605387831627252
+            conv = 1.6605387831627252
+            if self.pbc:
+                 vol = np.array([BuildLatticeFromLengthsAngles(*[float(j) for j in line.split()]).V \
+                                     for line in open("%s-md_beads001.arc" % self.name).readlines() \
+                                     if (len(line.split()) == 6 and isfloat(line.split()[1]) \
+                                             and all([isfloat(i) for i in line.split()[:6]]))]) / 1000
+                 rho  = conv * mass / vol
+            else:
+                vol = None
+                rho = None
+            prop_return = OrderedDict()
+            prop_return.update({'Rhos': rho, 'Potentials': edyn, 'Kinetics': kdyn, 'Volumes': vol, 'Dips': dip, 'Ecomps': ecomp})
+            return prop_return
+
+
         else:
-            vol = None
-            rho = None
-        prop_return = OrderedDict()
-        prop_return.update({'Rhos': rho, 'Potentials': edyn, 'Kinetics': kdyn, 'Volumes': vol, 'Dips': dip, 'Ecomps': ecomp})
-        return prop_return
+            if nequil > 0:
+                write_key("%s-eq.key" % self.name, eq_opts, "%s.key" % self.name, md_defs)
+                if verbose: printcool("Running DYNAMIC equilibration dynamics", color=0)
+                if self.pbc and pressure is not None:
+                    self.calltinker("dynamic %s -k %s-eq %i %f %f 4 %f %f" % (self.name, self.name, nequil, timestep, float(nsave*timestep)/1000, 
+                                                                              temperature, pressure), print_to_screen=verbose)
+                else:
+                    self.calltinker("dynamic %s -k %s-eq %i %f %f 2 %f" % (self.name, self.name, nequil, timestep, float(nsave*timestep)/1000,
+                                                                           temperature), print_to_screen=verbose)
+                os.system("rm -f %s.arc" % (self.name))
+
+            # Run production.
+            if verbose: printcool("Running DYNAMIC production dynamics", color=0)
+            write_key("%s-md.key" % self.name, md_opts, "%s.key" % self.name, md_defs)
+            if self.pbc and pressure is not None:
+                odyn = self.calltinker("dynamic %s -k %s-md %i %f %f 4 %f %f" % (self.name, self.name, nsteps, timestep, float(nsave*timestep)/1000, 
+                                                                                 temperature, pressure), print_to_screen=verbose)
+            else:
+                odyn = self.calltinker("dynamic %s -k %s-md %i %f %f 2 %f" % (self.name, self.name, nsteps, timestep, float(nsave*timestep)/1000, 
+                                                                           temperature), print_to_screen=verbose)
+
+            # Gather information.
+            os.system("mv %s.arc %s-md.arc" % (self.name, self.name))
+            self.md_trajectory = "%s-md.arc" % self.name
+
+            edyn = []
+            kdyn = []
+            temps = []
+            for line in odyn:
+                s = line.split()
+                if 'Current Potential' in line:
+                    edyn.append(float(s[2]))
+                if 'Current Kinetic' in line:
+                    kdyn.append(float(s[2]))
+                if len(s) > 0 and s[0] == 'Temperature' and s[2] == 'Kelvin':
+                    temps.append(float(s[1]))
+
+            # Potential and kinetic energies converted to kJ/mol.
+            edyn = np.array(edyn) * 4.184
+            kdyn = np.array(kdyn) * 4.184
+            temps = np.array(temps)
+
+            if verbose: logger.info("Post-processing to get the dipole moments\n")
+            oanl = self.calltinker("analyze %s-md.arc" % self.name, stdin="E,D", print_to_screen=True)
+            oanl_g = self.calltinker("analyze_ponder %s-md.arc" % self.name, stdin="G", print_to_screen=True)
+    
+            # Read potential energy and dipole from file.
+            eanl = []
+            dip = []
+            mass = 0.0
+            ecomp = OrderedDict()
+            havekeys = set()
+            first_shot = True
+            for ln, line in enumerate(oanl_g):
+                strip = line.strip()
+                s=line.split()
+                if 'Total System Mass' in line:
+                    mass = float(s[-1])
+            for ln, line in enumerate(oanl):
+                strip = line.strip()
+                s=line.split()
+                if 'Total Potential Energy : ' in line:
+                    eanl.append(float(s[4]))
+                if 'Dipole X,Y,Z-Components :' in line:
+                    dip.append([float(s[i]) for i in range(-3,0)])
+                if first_shot:
+                    for key in eckeys:
+                        if strip.startswith(key):
+                            if key in ecomp:
+                                ecomp[key].append(float(s[-2])*4.184)
+                            else:
+                                ecomp[key] = [float(s[-2])*4.184]
+                            if key in havekeys:
+                                first_shot = False
+                            havekeys.add(key)
+                else:
+                    for key in havekeys:
+                        if strip.startswith(key):
+                            if key in ecomp:
+                                ecomp[key].append(float(s[-2])*4.184)
+                            else:
+                                ecomp[key] = [float(s[-2])*4.184]
+            for key in ecomp:
+                ecomp[key] = np.array(ecomp[key])
+            ecomp["Potential Energy"] = edyn
+            ecomp["Kinetic Energy"] = kdyn
+            ecomp["Temperature"] = temps
+            ecomp["Total Energy"] = kdyn+edyn
+    
+            # Energies in kilojoules per mole
+            eanl = np.array(eanl) * 4.184
+            # Dipole moments in debye
+            dip = np.array(dip)
+
+
+#           Volume of simulation boxes in cubic nanometers
+#           Conversion factor derived from the following:
+#           In [22]: 1.0 * gram / mole / (1.0 * nanometer)**3 / AVOGADRO_CONSTANT_NA / (kilogram/meter**3)
+#           Out[22]: 1.6605387831627252
+            conv = 1.6605387831627252
+            if self.pbc:
+                 vol = np.array([BuildLatticeFromLengthsAngles(*[float(j) for j in line.split()]).V \
+                                     for line in open("%s-md.arc" % self.name).readlines() \
+                                     if (len(line.split()) == 6 and isfloat(line.split()[1]) \
+                                             and all([isfloat(i) for i in line.split()[:6]]))]) / 1000
+                 rho  = conv * mass / vol
+                 print('HERE')
+                 print(rho)
+                 print(conv)
+                 print(mass)
+                 print(vol)
+            else:
+                 vol = None
+                 rho = None
+            prop_return = OrderedDict()
+            prop_return.update({'Rhos': rho, 'Potentials': edyn, 'Kinetics': kdyn, 'Volumes': vol, 'Dips': dip, 'Ecomps': ecomp})
+            return prop_return
 
 class Liquid_TINKER(Liquid):
     """ Condensed phase property matching using TINKER. """
@@ -1077,9 +1296,9 @@ class Liquid_TINKER(Liquid):
                 logger.error('Please provide %s; it is needed to proceed.\n' % i)
                 raise RuntimeError
         # Send back the trajectory file.
-        self.extra_output = ['liquid.dyn']
+        self.extra_output=['liquid.dyn']
         if self.save_traj > 0:
-            self.extra_output += ['liquid-md.arc']
+            self.extra_output+=['liquid.arc']
         # Dictionary of .dyn files used to restart simulations.
         self.DynDict = OrderedDict()
         self.DynDict_New = OrderedDict()
@@ -1092,10 +1311,14 @@ class Liquid_TINKER(Liquid):
             self.DynDict[(temperature, pressure)] = self.DynDict_New[(temperature, pressure)]
         if (temperature, pressure) in self.DynDict:
             dynsrc = self.DynDict[(temperature, pressure)]
-            dyndest = os.path.join(os.getcwd(), 'liquid.dyn')
-            logger.info("Copying .dyn file: %s to %s\n" % (dynsrc, dyndest))
-            shutil.copy2(dynsrc,dyndest)
-            self.nptfiles.append(dyndest)
+            path="/".join(dynsrc.split('/')[:-1])
+            dynsrcs=glob.glob(path+"/liquid*.dyn")
+            for dynsrc in dynsrcs:
+                ff=dynsrc.split('/')[-1]
+                dyndest = os.path.join(os.getcwd(),ff)
+                logger.info("Copying .dyn file: %s to %s\n" % (dynsrc, dyndest))
+                shutil.copy2(dynsrc,dyndest)
+                self.nptfiles.append(dyndest)
         self.DynDict_New[(temperature, pressure)] = os.path.join(os.getcwd(),'liquid.dyn')
         super(Liquid_TINKER, self).npt_simulation(temperature, pressure, simnum)
         self.last_traj = [i for i in self.last_traj if '.dyn' not in i]

@@ -39,6 +39,8 @@ class Hydration(Target):
         self.set_option(tgt_opts,'normalize')
         # Energy denominator for evaluating this target
         self.set_option(tgt_opts,'energy_denom','denom')
+        #Use (or not) of PIMD
+        self.set_option(tgt_opts,'pimd',forceprint=True)
         # Number of time steps in the liquid "equilibration" run
         self.set_option(tgt_opts,'liquid_eq_steps',forceprint=True)
         # Number of time steps in the liquid "production" run
@@ -169,18 +171,23 @@ class Hydration(Target):
         md_opts['temperature'] = self.hfe_temperature
         md_opts['pressure'] = self.hfe_pressure
         md_opts['minimize'] = True
+        md_opts['pimd']= False
         if liq: 
             sdnm = 'liq'
             md_opts['nequil'] = self.liquid_eq_steps
+            md_opts['nbeads'] = self.liquid_nbeads
             md_opts['nsteps'] = self.liquid_md_steps
             md_opts['timestep'] = self.liquid_timestep
             md_opts['sample'] = self.liquid_interval
+                
         else: 
             sdnm = 'gas'
+            md_opts['nbeads'] = self.gas_nbeads
             md_opts['nequil'] = self.gas_eq_steps
             md_opts['nsteps'] = self.gas_md_steps
             md_opts['timestep'] = self.gas_timestep
             md_opts['sample'] = self.gas_interval
+
 
         eng_opts = deepcopy(self.engine_opts)
         # Enforce implicit solvent in the liquid simulation.
